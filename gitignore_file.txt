@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.Python
+venv/
+env/
+ENV/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Tor
+tor/
+tor_data/
+tor_data_client/
+
+# Application data
+.nishizumishare/
+.nishizumi-sync-client/
+NishizumiShare/
+NishizumiSyncServerLite/
+
+# Configuration
+settings.json
+team_peers.txt
+security_rules.txt
+scan_cache.json
+admin_key
+onion_key
+onion_private_key
+onion_private_key.bak
+share_dir.txt
+one_time_token_log.jsonl
+
+# Quarantine
+.quarantine/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+
+# Test files
+test_files/
+temp/
