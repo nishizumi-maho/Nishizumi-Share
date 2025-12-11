@@ -1,5 +1,8 @@
 # Nishizumi Share
 
+<img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/4951276a-0260-4565-b107-9673046bf23e" />
+
+
 **Secure, anonymous file sharing over Tor hidden services**
 
 Nishizumi Share is a privacy-focused file synchronization system designed for secure team collaboration. It uses Tor hidden services (.onion) to enable anonymous, peer-to-peer file sharing without exposing IP addresses or requiring central servers.
