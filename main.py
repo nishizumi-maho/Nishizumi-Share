@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Nishizumi Share — Secure v2.2.1 (final)
+Nishizumi Share — Secure v2.2.1
 =====================================
-Version: v2.2.1
-Purpose:
- - Restores the original UI (Client / Engineer / System) with improvements (usability + clarity).
- - Adds ephemeral access tokens (UI-generated) for one-off sharing.
- - Implements smooth throttling using a Token Bucket algorithm (client download + server upload).
- - Enforces AV scanning (Microsoft Defender on Windows / ClamAV on Unix-like systems).
- - Keeps Data Leak Protection (DLP: rename/sanitize), quarantine flow, path safety checks, ephemeral mapping.
- - Extensive inline technical documentation (developer manual embedded).
-
-License: MIT — include LICENSE in your repository when publishing.
 Quick start:
  - Requirements: Python 3.10+, pip install Flask PyQt6 requests waitress
  - Save as: nishizumi_share_v2_2_1.py
@@ -26,10 +16,10 @@ Quick start:
 """
 
 # ------------------------------------------------------------------------------ 
-# MIT License header (add LICENSE file to your repo)
+# MIT License
 # ------------------------------------------------------------------------------ 
 # Copyright (c) 2025
-#
+# Maho Nishizumi
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
 # in the Software without restriction...
