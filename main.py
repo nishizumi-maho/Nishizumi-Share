@@ -25,9 +25,9 @@ Quick start:
  - Monitor logs in the System tab for operational details
 """
 
-# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------ 
 # MIT License header (add LICENSE file to your repo)
-# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------ 
 # Copyright (c) 2025
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -58,7 +58,10 @@ from urllib.parse import quote
 from flask import Flask, request, jsonify, Response
 
 # Use waitress as production WSGI server
-from waitress import serve
+try:
+    from waitress import serve
+except Exception:
+    serve = None  # will be checked before use
 
 # PyQt6 (UI)
 from PyQt6.QtWidgets import (
@@ -139,12 +142,18 @@ DEFAULT_SETTINGS = {
     "force_av_scan": FORCE_AV_SCAN_DEFAULT,
     "peers": [],
     "share_dir": "",
-    "save_dir": ""
+    "save_dir": "",
+    "sync_mode": 3,
+    "team_folder": "Team_Setups"
 }
 
 if os.path.exists(SETTINGS_FILE):
     try:
         SETTINGS = json.loads(open(SETTINGS_FILE, "r", encoding="utf-8").read() or "{}")
+        # ensure keys exist
+        for k, v in DEFAULT_SETTINGS.items():
+            if k not in SETTINGS:
+                SETTINGS[k] = v
     except Exception:
         SETTINGS = DEFAULT_SETTINGS.copy()
 else:
@@ -159,6 +168,10 @@ def save_settings():
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(SETTINGS, f, indent=2)
+        try:
+            os.chmod(SETTINGS_FILE, 0o600)
+        except Exception:
+            pass
     except Exception:
         logger.exception("Failed to save settings")
 
@@ -226,8 +239,8 @@ def save_json(path: str, obj):
 def sha256_of_file(path: str) -> str:
     """Return SHA256 hex digest of a file (streamed)."""
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
             h.update(chunk)
     return h.hexdigest()
 
@@ -772,8 +785,13 @@ class TorManagerWorker(QThread):
 
         # Run Flask app with Waitress (production WSGI) inside this thread (blocks)
         try:
-            # threads=4 is a reasonable default; change via SETTINGS if you need.
-            serve(app, host="127.0.0.1", port=FLASK_PORT, threads=4)
+            if serve is None:
+                # fallback to development server if waitress not installed (warn)
+                self.status_update.emit("Waitress not available, running Flask dev server (not recommended).")
+                app.run(port=FLASK_PORT, use_reloader=False, threaded=True)
+            else:
+                # threads=4 is a reasonable default; change via SETTINGS if you need.
+                serve(app, host="127.0.0.1", port=FLASK_PORT, threads=4)
         except Exception:
             logger.exception("Waitress serve failed")
 
@@ -937,9 +955,10 @@ class MainAppWindow(QWidget):
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-        self.lbl_global_status = QLabel("NETWORK: INITIALIZING...")
+        # set initial status to "not running" to reflect actual behavior
+        self.lbl_global_status = QLabel("SERVER NOT RUNNING")
         self.lbl_global_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_global_status.setStyleSheet("background:#333; color:#fff; padding:8px; font-weight:bold; border-radius:6px;")
+        self.lbl_global_status.setStyleSheet("background:#555; color:#fff; padding:8px; font-weight:bold; border-radius:6px;")
         layout.addWidget(self.lbl_global_status)
 
         self.tabs = QTabWidget()
@@ -1136,10 +1155,19 @@ class MainAppWindow(QWidget):
             ul = SETTINGS.get("upload_limit_bps", DEFAULT_UPLOAD_LIMIT_BPS) // 1024
             self.input_dl.setText(str(int(dl))); self.input_ul.setText(str(int(ul)))
             self.chk_force_av.setChecked(SETTINGS.get("force_av_scan", FORCE_AV_SCAN_DEFAULT))
+            # restore share/save folders
             if SETTINGS.get("share_dir"):
                 global SWARM_FOLDER
                 SWARM_FOLDER = SETTINGS.get("share_dir"); self.lbl_orig.setText(os.path.basename(SWARM_FOLDER))
-            if SETTINGS.get("save_dir"): self.lbl_dest.setText(SETTINGS.get("save_dir"))
+            if SETTINGS.get("save_dir"):
+                self.lbl_dest.setText(SETTINGS.get("save_dir"))
+            # restore sync mode and team folder
+            if SETTINGS.get("team_folder"):
+                self.txt_team.setText(SETTINGS.get("team_folder"))
+            if SETTINGS.get("sync_mode") == 3:
+                self.rb_smart.setChecked(True)
+            else:
+                self.rb_folder.setChecked(True)
         except Exception:
             pass
 
@@ -1157,6 +1185,9 @@ class MainAppWindow(QWidget):
         self.tor_worker.status_update.connect(self.write_log)
         self.tor_worker.onion_ready.connect(self.on_onion_ready)
         self.tor_worker.identity_reset.connect(lambda: QMessageBox.warning(self, "Identity", "Identity regenerated"))
+        # update status
+        self.lbl_global_status.setText("STARTING TOR SERVER…")
+        self.lbl_global_status.setStyleSheet("background:#FFA000; color:#000; padding:8px; font-weight:bold; border-radius:6px;")
         self.tor_worker.start()
         self.write_log("Starting server (Tor)...")
 
@@ -1181,6 +1212,9 @@ class MainAppWindow(QWidget):
             SETTINGS["force_av_scan"] = self.chk_force_av.isChecked()
             peers = [l.strip() for l in self.txt_peers.toPlainText().splitlines() if l.strip()]
             SETTINGS["peers"] = peers
+            # save sync_mode and team_folder
+            SETTINGS["sync_mode"] = 3 if self.rb_smart.isChecked() else 2
+            SETTINGS["team_folder"] = self.txt_team.text().strip() or "Team_Setups"
             save_settings()
         except Exception:
             self.write_log("Error applying limits")
