@@ -28,9 +28,9 @@ Nishizumi Share is a privacy-focused file synchronization system designed for se
 
 Nishizumi Share comes in three variants:
 
-1. **Main Application** (`teste.py`) - Full-featured client + server with advanced DLP
-2. **Lite Server** (`Servidor.py`) - Simplified server-only deployment
-3. **Lite Client** (`cliente.py`) - Lightweight client for downloads only
+1. **Main Application** (`Main_full.py`) - Full-featured client + server with advanced DLP
+2. **Lite Server** (`server_lite.py`) - Simplified server-only deployment
+3. **Lite Client** (`client_lite.py`) - Lightweight client for downloads only
 
 ## Quick Start
 
