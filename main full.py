@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Nishizumi Share — Secure v2.2.1 (final) — PATCHED (single-file)
-=============================================================
-Patch summary (minimal, applied globally in this file):
- - AV effectively DISABLED: av_scan_file always returns (True, "av_disabled")
-   (keeps scanner functions present for logs/diagnostics but they are bypassed)
- - Client saves filenames with the appended deterministic HMAC/hash removed:
-   any path component that ends with "__<hex>" will have that suffix stripped
-   before mapping to local disk.
- - No other behaviour changed; server still exposes /list, /download, ephemeral
-   maps and token logic identical to original except AV bypass.
-
+Nishizumi Share — Secure v2.2.1 (final) — PATCHED
+===============================================
+This is the full program file.
+ - AV scanning effectively disabled by default (see AV_DISABLE_GLOBAL)
+ - Client strips the deterministic HMAC suffix "__<hex16>" from filenames when saving
+ - Tor process is tracked and forcibly terminated when the GUI closes / identity is regenerated
+ - Minor robustness fixes to avoid the 'contains' call and other issues observed
 """
 # ------------------------------------------------------------------------------ 
 # MIT License header (add LICENSE file to your repo)
@@ -22,7 +18,6 @@ Patch summary (minimal, applied globally in this file):
 # of this software and associated documentation files (the "Software"), to deal
 # in the Software without restriction...
 # ------------------------------------------------------------------------------
-
 
 # -------------------------
 # Imports
@@ -103,7 +98,10 @@ ONE_TIME_TOKEN_TTL_DEFAULT = 3600  # default one-time token validity (1 hour)
 DEFENDER_PATH = os.path.expandvars(r"%ProgramFiles%\Windows Defender\MpCmdRun.exe")
 
 # Force AV scan default (UI toggle can override)
-FORCE_AV_SCAN_DEFAULT = True
+# You requested AV disabled entirely; we provide a global switch.
+FORCE_AV_SCAN_DEFAULT = False
+# If you want "truly disabled even if UI toggles it", set AV_DISABLE_GLOBAL = True
+AV_DISABLE_GLOBAL = True
 
 # Logging
 logger = logging.getLogger("nishizumi_secure")
@@ -356,22 +354,22 @@ def scan_with_clamav(path: str, timeout: int = 120):
                 return False, f"clam_exception:{str(e)[:200]}"
     return False, "clam_not_found"
 
-# GLOBAL flag: when True, bypass all AV checks and treat files as clean.
-# This implements the "AV disabled" behaviour you requested.
-DISABLE_AV_COMPLETELY = True
-
 def av_scan_file(path: str, force_scan: bool = False):
     """
     High-level AV wrapper:
-      - When DISABLE_AV_COMPLETELY is True -> immediately return clean (True, "av_disabled")
-      - Otherwise: use cached result if SHA256 is cached within 24h
+      - If AV_DISABLE_GLOBAL True => skip scanning and return clean
+      - Use cached result if SHA256 is cached within 24h
       - Try Defender (Windows) then ClamAV
       - Cache result and return (clean_bool, reason)
       - If force_scan=True and no scanner available -> return (False, reason)
     """
-    if DISABLE_AV_COMPLETELY:
-        # Bypass all scanning logic and return "clean".
-        return True, "av_disabled"
+    # Respect the global disable switch first
+    if AV_DISABLE_GLOBAL:
+        return True, "av_disabled_global"
+
+    # Also respect UI/settings (if av global not forced off)
+    if not SETTINGS.get("force_av_scan", FORCE_AV_SCAN_DEFAULT) and not force_scan:
+        return True, "av_disabled_by_settings"
 
     try:
         sha = sha256_of_file(path)
@@ -506,6 +504,30 @@ def ensure_global_upload_bucket():
     GLOBAL_UPLOAD_BUCKET = TokenBucket(capacity, float(ul))
 
 # -------------------------
+# Helper: strip deterministic HMAC suffix from fake path names
+# -------------------------
+HMAC_SUFFIX_RE = re.compile(r'__(?P<h>[0-9a-fA-F]{16})$')
+
+def strip_hmac_from_fake(fake_path: str) -> str:
+    """
+    Remove the trailing __<hex16> suffix from the final filename component of a fake path.
+    Example: 'car/dir/filename__abcd1234abcd1234' -> 'car/dir/filename'
+    """
+    try:
+        parts = fake_path.replace("\\", "/").split("/")
+        if not parts:
+            return fake_path
+        last = parts[-1]
+        m = HMAC_SUFFIX_RE.search(last)
+        if m:
+            last = last[:m.start()]
+            parts[-1] = last
+            return "/".join(parts)
+        return fake_path
+    except Exception:
+        return fake_path
+
+# -------------------------
 # Flask endpoints: /list and /download
 # -------------------------
 @app.route("/list", methods=["GET"])
@@ -582,8 +604,11 @@ def download_file(map_id, fake_name):
     if not entry:
         return jsonify({"error": "map_not_found"}), 404
     virtual_map = entry.get("map", {})
+    # fake_name arrives url-decoded by Flask; it must match an entry in the virtual_map.
     real_path = virtual_map.get(fake_name)
     if not real_path or not os.path.exists(real_path):
+        # try fallback: maybe client stripped the HMAC suffix; map keys are the full fake path,
+        # so no direct fallback is possible here. Return not found.
         return jsonify({"error": "file_not_found"}), 404
     if not is_within_directory(SWARM_FOLDER, real_path):
         return jsonify({"error": "forbidden"}), 403
@@ -672,6 +697,9 @@ class TorManagerWorker(QThread):
     Starts a tor.exe process and configures an onion service via the ControlPort.
     On success, emits onion_ready(onion_url) and then runs the Flask app under Waitress
     inside this thread (blocking). Using Waitress provides production-grade serving.
+
+    This patched worker stores the tor subprocess handle as self.tor_proc and provides
+    terminate_tor() to stop it when requested.
     """
     status_update = pyqtSignal(str)
     onion_ready = pyqtSignal(str)
@@ -682,6 +710,35 @@ class TorManagerWorker(QThread):
         self.tor_exe_path = tor_exe_path
         self.control_password = None
         self.hashed_password = None
+        self.tor_proc: Optional[subprocess.Popen] = None
+        self._stop_requested = False
+
+    def terminate_tor(self):
+        """Forcefully terminate tor process if running."""
+        try:
+            self._stop_requested = True
+            if self.tor_proc:
+                try:
+                    # try a graceful SIGTERM first
+                    self.tor_proc.terminate()
+                    # wait shortly
+                    try:
+                        self.tor_proc.wait(timeout=3)
+                        self.tor_proc = None
+                        return
+                    except subprocess.TimeoutExpired:
+                        pass
+                    # fallback to kill
+                    self.tor_proc.kill()
+                except Exception:
+                    pass
+                try:
+                    self.tor_proc.wait(timeout=2)
+                except Exception:
+                    pass
+                self.tor_proc = None
+        except Exception:
+            logger.exception("terminate_tor failed")
 
     def run(self):
         if not self.tor_exe_path or not os.path.exists(self.tor_exe_path):
@@ -714,14 +771,20 @@ class TorManagerWorker(QThread):
             self.status_update.emit("Hashed password generation failed; will try cookie auth.")
 
         try:
-            tor_proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                        creationflags=0x08000000 if sys.platform == 'win32' else 0)
+            # On Windows Popen flags to detach: use creationflags to avoid console,
+            # but we need the process handle to terminate later.
+            creationflags = 0
+            if sys.platform == 'win32':
+                creationflags = 0x08000000  # CREATE_NO_WINDOW
+            self.tor_proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags)
         except Exception as e:
             self.status_update.emit("Failed to start Tor: " + str(e))
             return
 
         sock = None
-        for _ in range(15):
+        for _ in range(30):
+            if self._stop_requested:
+                break
             try:
                 sock = socket.create_connection((CTRL_HOST, CTRL_PORT), timeout=5)
                 break
@@ -729,8 +792,12 @@ class TorManagerWorker(QThread):
                 time.sleep(1)
         if not sock:
             self.status_update.emit("ControlPort not reachable")
-            try: tor_proc.kill()
+            try:
+                if self.tor_proc:
+                    try: self.tor_proc.kill()
+                    except: pass
             except: pass
+            self.tor_proc = None
             return
 
         authenticated = False
@@ -745,8 +812,12 @@ class TorManagerWorker(QThread):
 
         if not authenticated:
             self.status_update.emit("Could not authenticate to Tor ControlPort")
-            try: tor_proc.kill()
+            try:
+                if self.tor_proc:
+                    try: self.tor_proc.kill()
+                    except: pass
             except: pass
+            self.tor_proc = None
             return
 
         # ADD_ONION phase: restore existing key if present; otherwise create a new one
@@ -825,18 +896,6 @@ class SwarmSyncWorker(QThread):
     def write_log(self, msg: str):
         self.log.emit(msg)
 
-    @staticmethod
-    def _strip_hmac_suffix_from_path_components(path: str) -> str:
-        """
-        Remove trailing '__[hex]' suffix from any path component.
-        Example: "car/dir/file__abcdef1234567890" -> "car/dir/file"
-        This is intended to remove the deterministic HMAC appended by the server
-        (the dlp_manager.make_fake_name outputs ...__<hex>).
-        """
-        parts = path.replace("\\", "/").split("/")
-        stripped = [re.sub(r'__[\da-fA-F]+$', '', p) for p in parts]
-        return "/".join(stripped)
-
     def run(self):
         """Continuous sync loop."""
         import requests
@@ -865,13 +924,11 @@ class SwarmSyncWorker(QThread):
                     for rf in remote_files:
                         if not self.running: break
                         rel_path = rf.get("path")
-                        if self.only_sto and ".sto" not in rel_path.lower(): 
+                        if self.only_sto and ".sto" not in rel_path.lower():
                             continue
-
-                        # REMOVE HASH SUFFIX from each path component before mapping locally
+                        # rel_path is the fake path (with __hmac suffixes). Strip HMAC suffix from filename for local saving.
                         clean_rel_path = rel_path.replace("\\", "/")
-                        clean_rel_path = self._strip_hmac_suffix_from_path_components(clean_rel_path)
-
+                        clean_rel_path = strip_hmac_from_fake(clean_rel_path)
                         # Map to local path depending on sync_mode
                         if self.sync_mode == 3:
                             parts = clean_rel_path.split("/")
@@ -894,7 +951,6 @@ class SwarmSyncWorker(QThread):
                                 should_download = True
                         if not should_download: continue
                         if not self.is_safe_path(self.save_dir, local_path): continue
-                        # FILENAME to use in logs / progress (basename after stripping)
                         fname = os.path.basename(local_path)
                         size = rf.get("size", 0)
                         if size and size > SETTINGS.get("max_file_size", DEFAULT_MAX_DOWNLOAD_BYTES):
@@ -902,17 +958,13 @@ class SwarmSyncWorker(QThread):
                             continue
                         tmp_dir = os.path.join(self.save_dir, ".quarantine")
                         os.makedirs(tmp_dir, exist_ok=True)
-                        # tmp filename: keep original fname but do NOT include the hash suffix
-                        safe_fname = re.sub(r'__[\da-fA-F]+$', '', fname)
-                        tmp_path = os.path.join(tmp_dir, secrets.token_hex(8) + "_" + safe_fname)
+                        tmp_path = os.path.join(tmp_dir, secrets.token_hex(8) + "_" + fname)
                         headers = {"Authorization": f"Bearer {map_token}"}
                         try:
-                            # Use the original rel_path (with hashes) in the download URL,
-                            # because the server's ephemeral map keys are keyed by the fake names.
-                            # We still save locally with the stripped name (safe_fname).
-                            with requests.get(f"{peer_url}/download/{quote(map_id)}/{quote(rel_path, safe='')}", proxies=proxies, stream=True, timeout=120, headers=headers) as fr:
+                            # Important: request must use the original fake rel_path (with HMAC) because server maps that to real files.
+                            with requests.get(f"{peer_url}/download/{quote(map_id)}/{quote(rf.get('path'), safe='')}", proxies=proxies, stream=True, timeout=120, headers=headers) as fr:
                                 if fr.status_code != 200:
-                                    self.write_log(f"Failed to download {safe_fname} from {peer}")
+                                    self.write_log(f"Failed to download {fname} from {peer} status={fr.status_code}")
                                     continue
                                 total_length = fr.headers.get("content-length")
                                 dl = 0
@@ -920,34 +972,45 @@ class SwarmSyncWorker(QThread):
                                     if total_length is None:
                                         for chunk in fr.iter_content(chunk_size=chunk_size):
                                             if not self.running: break
+                                            if not chunk:
+                                                continue
                                             dl_bucket.consume(len(chunk))
                                             outf.write(chunk)
                                     else:
                                         total_length = int(total_length)
                                         for chunk in fr.iter_content(chunk_size=chunk_size):
                                             if not self.running: break
+                                            if not chunk:
+                                                continue
                                             dl_bucket.consume(len(chunk))
                                             dl += len(chunk)
                                             outf.write(chunk)
                                             pct = int(100 * dl / (total_length or 1))
-                                            self.progress_update.emit(pct, f"Downloading {safe_fname}")
+                                            self.progress_update.emit(pct, f"Downloading {fname}")
                                 try: os.chmod(tmp_path, 0o600)
                                 except: pass
+                                # AV check: if AV_DISABLE_GLOBAL True or settings say off, av_scan_file returns clean
                                 scan_ok, reason = av_scan_file(tmp_path, force_scan=SETTINGS.get("force_av_scan", FORCE_AV_SCAN_DEFAULT))
                                 if not scan_ok:
                                     try: os.remove(tmp_path)
                                     except: pass
-                                    self.write_log(f"AV blocked {safe_fname}: {reason}")
+                                    self.write_log(f"AV blocked {fname}: {reason}")
                                     continue
                                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                                # move tmp_path -> local_path; ensure final local filename uses safe_fname (no __hash)
-                                final_local_dir = os.path.dirname(local_path)
-                                final_local_path = os.path.join(final_local_dir, safe_fname)
-                                # replace atomically
-                                os.replace(tmp_path, final_local_path)
-                                os.utime(final_local_path, (time.time(), int(time.time())))
+                                # move tmp -> final
+                                try:
+                                    os.replace(tmp_path, local_path)
+                                except Exception:
+                                    # fallback: copy then remove
+                                    try:
+                                        shutil.copyfile(tmp_path, local_path)
+                                        os.remove(tmp_path)
+                                    except Exception:
+                                        self.write_log(f"Failed to move downloaded file to final location {local_path}")
+                                        continue
+                                os.utime(local_path, (time.time(), int(time.time())))
                                 total_new += 1
-                                self.progress_update.emit(100, f"Saved {safe_fname}")
+                                self.progress_update.emit(100, f"Saved {fname}")
                         except Exception:
                             logger.exception("Download exception")
                             try:
@@ -1277,6 +1340,7 @@ class MainAppWindow(QWidget):
             ul_kb = max(0, int(self.input_ul.text().strip()))
             SETTINGS["download_limit_bps"] = dl_kb * 1024
             SETTINGS["upload_limit_bps"] = ul_kb * 1024
+            # Since user requested AV disabled globally, keep SETTINGS updated but AV_DISABLE_GLOBAL governs behavior.
             SETTINGS["force_av_scan"] = self.chk_force_av.isChecked()
             peers = [l.strip() for l in self.txt_peers.toPlainText().splitlines() if l.strip()]
             SETTINGS["peers"] = peers
@@ -1316,6 +1380,15 @@ class MainAppWindow(QWidget):
             except: pass
         QMessageBox.information(self, "Identity removed", "Saved identity removed. Start the server to create a new one.")
         self.write_log("User removed identity")
+        # If tor is running, terminate it so a fresh identity will be created on next start
+        try:
+            if self.tor_worker:
+                try:
+                    self.tor_worker.terminate_tor()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # -------------------------
     # Ephemeral token UI actions
@@ -1380,6 +1453,22 @@ class MainAppWindow(QWidget):
         cb.setText(token)
         QMessageBox.information(self, "Copied", "Token copied to clipboard")
 
+    # Ensure tor process is killed when GUI closes
+    def closeEvent(self, event):
+        try:
+            if self.sync_worker and self.sync_worker.isRunning():
+                self.sync_worker.stop()
+                # give it a moment
+                time.sleep(0.2)
+            if self.tor_worker:
+                try:
+                    self.tor_worker.terminate_tor()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        event.accept()
+
 # -------------------------
 # Entrypoint
 # -------------------------
@@ -1392,4 +1481,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
