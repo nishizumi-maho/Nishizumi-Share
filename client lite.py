@@ -2,21 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 Nishizumi Sync Client — Secure (embedded-or-external Tor)
-Version: 1.0
+Version: 1.1 (patched)
+- Tor start/stop fixes: only kills processes started by this program; if SOCKS port is already in uso,
+  the client assumes Tor is available and uses it (no duplicate tor started).
+- AV removed entirely (no Defender/ClamAV calls).
+- Removed __<hash> suffix from filenames when saving.
+- Robust bootstrap detection and safer timeouts.
 Requirements: Python 3.10+, pip install PyQt6 requests pysocks
-
-Features:
- - Option: use embedded Tor (bundled tor/ directory) OR use external tor.exe path
- - Starts embedded tor as a client-only process (no onion service)
- - Validates Tor bootstrap (Bootstrapped 100%) before using it
- - SOCKS5h proxy usage for all requests (requests + pysocks)
- - Secure download flow: .quarantine -> AV scan (Windows Defender or ClamAV) -> atomic move
- - TokenBucket throttling for download
- - Strict path safety checks to avoid traversal
- - Save settings, autostart on Windows (registry Run)
- - Minimal, safe UI (PyQt6)
 """
-
 import os
 import sys
 import time
@@ -28,6 +21,7 @@ from pathlib import Path
 from typing import Optional, List
 import hashlib
 import secrets
+import socket
 
 import requests
 # ensure SOCKS support
@@ -52,7 +46,7 @@ os.makedirs(CONFIG_DIR, exist_ok=True)
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 TOR_DATA_DIR = os.path.join(CONFIG_DIR, "tor_data_client")
 TOR_BUNDLE_DIRNAME = "tor"   # expected bundled tor directory (Tor Expert Bundle)
-SOCKS_PORT = 9050
+SOCKS_PORT = 9053
 DEFAULT_DL_LIMIT_BPS = 2 * 1024 * 1024
 QUARANTINE_DIRNAME = ".quarantine"
 SCAN_CACHE_FILE = os.path.join(CONFIG_DIR, "scan_cache.json")
@@ -101,7 +95,13 @@ def save_settings():
         logger.exception("save_settings failed")
 
 # -------------------------
-# AV scanning (Defender/Clam)
+# NOTE: AV removed entirely
+# All scan functions and calls were removed to honor "remova o AV totalmente".
+# If you later want AV back, we can add an opt-in toggle.
+# -------------------------
+
+# -------------------------
+# Utilities
 # -------------------------
 def sha256_of_file(path: str) -> Optional[str]:
     try:
@@ -113,86 +113,6 @@ def sha256_of_file(path: str) -> Optional[str]:
     except Exception:
         return None
 
-def load_scan_cache():
-    if os.path.exists(SCAN_CACHE_FILE):
-        try:
-            return json.load(open(SCAN_CACHE_FILE, "r", encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-_scan_cache = load_scan_cache()
-
-def save_scan_cache(cache):
-    try:
-        with open(SCAN_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2)
-        try: os.chmod(SCAN_CACHE_FILE, 0o600)
-        except: pass
-    except Exception:
-        logger.exception("save_scan_cache failed")
-
-DEFENDER_PATH = os.path.expandvars(r"%ProgramFiles%\Windows Defender\MpCmdRun.exe")
-
-def scan_with_windows_defender(path: str, timeout: int = 60):
-    if not os.path.exists(DEFENDER_PATH):
-        return False, "defender_not_found"
-    cmd = [DEFENDER_PATH, "-Scan", "-ScanType", "3", "-File", path]
-    try:
-        res = subprocess.run(cmd, capture_output=True, timeout=timeout)
-        if res.returncode == 0:
-            return True, "clean"
-        else:
-            out = (res.stdout.decode(errors="ignore") + res.stderr.decode(errors="ignore"))[:400]
-            return False, f"defender_nonzero:{res.returncode}:{out}"
-    except subprocess.TimeoutExpired:
-        return False, "defender_timeout"
-    except Exception as e:
-        return False, f"defender_exception:{str(e)[:200]}"
-
-def scan_with_clamav(path: str, timeout: int = 120):
-    for exe in ("clamdscan", "clamscan"):
-        if shutil.which(exe):
-            cmd = [exe, "--no-summary", path]
-            try:
-                res = subprocess.run(cmd, capture_output=True, timeout=timeout)
-                out = (res.stdout.decode(errors="ignore") + res.stderr.decode(errors="ignore"))[:400]
-                if res.returncode == 0:
-                    return True, "clean"
-                elif res.returncode == 1:
-                    return False, f"clam_infected:{out}"
-                else:
-                    return False, f"clam_error:{res.returncode}:{out}"
-            except subprocess.TimeoutExpired:
-                return False, "clam_timeout"
-            except Exception as e:
-                return False, f"clam_exception:{str(e)[:200]}"
-    return False, "clam_not_found"
-
-def av_scan_file(path: str, force_scan: bool = False):
-    sha = sha256_of_file(path)
-    if not sha:
-        return False, "hash_error"
-    now = int(time.time())
-    cached = _scan_cache.get(sha)
-    if cached and (now - cached.get("ts", 0) < 24 * 3600):
-        return cached.get("clean", False), cached.get("reason", "cached")
-    # attempt Defender on Windows, else ClamAV
-    if sys.platform.startswith("win"):
-        ok, reason = scan_with_windows_defender(path)
-        if not ok and reason == "defender_not_found":
-            ok, reason = scan_with_clamav(path)
-    else:
-        ok, reason = scan_with_clamav(path)
-    _scan_cache[sha] = {"clean": ok, "reason": reason, "ts": now}
-    save_scan_cache(_scan_cache)
-    if not ok and force_scan:
-        return False, reason
-    return ok, reason
-
-# -------------------------
-# Utilities
-# -------------------------
 def is_within_directory(base_dir: str, target_path: str) -> bool:
     try:
         base = Path(base_dir).resolve()
@@ -241,7 +161,7 @@ class TokenBucket:
             time.sleep(wait)
 
 # -------------------------
-# Tor embedded/external management
+# Tor embedded/external management (fixed)
 # -------------------------
 def _app_base_path() -> str:
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -269,7 +189,18 @@ def find_system_tor_in_path() -> Optional[str]:
             return cand
     return None
 
+def _is_port_open(host: str, port: int, timeout=0.8) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
 class TorProcess:
+    """
+    Starts Tor only if SOCKS port not already occupied.
+    Keeps track of the subprocess it actually started; stop() kills only that process.
+    """
     def __init__(self, socks_port: int = SOCKS_PORT, external_path: Optional[str] = None, prefer_bundled: bool = True):
         self.socks_port = socks_port
         self.proc: Optional[subprocess.Popen] = None
@@ -277,6 +208,7 @@ class TorProcess:
         self.prefer_bundled = prefer_bundled
         self.tor_path = None
         os.makedirs(TOR_DATA_DIR, exist_ok=True)
+        self.started_by_me = False
 
     def locate(self):
         if self.external_path and os.path.exists(self.external_path):
@@ -302,22 +234,34 @@ class TorProcess:
                 return
 
     def start(self, bootstrap_timeout: int = 30) -> bool:
-        if self.proc and self.proc.poll() is None:
+        """
+        Return True if a usable SOCKS is available (either existing or started by us).
+        If SOCKS port already in use, we assume Tor is running and return True (no action).
+        """
+        # If SOCKS already open, assume Tor is fine
+        if _is_port_open("127.0.0.1", self.socks_port, timeout=0.6):
+            logger.info("SOCKS port %d already open — using existing Tor.", self.socks_port)
+            self.started_by_me = False
             return True
+
+        # locate binary
         self.locate()
         if not self.tor_path:
             logger.info("Tor executable not found")
             return False
+
         args = [self.tor_path, "--SocksPort", str(self.socks_port), "--DataDirectory", TOR_DATA_DIR, "--Log", "notice stdout"]
         try:
-            # Start the process and read stdout to watch bootstrap progress
+            # On Windows, create process normally; on Unix, same. We'll capture stdout to detect bootstrap.
             self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.started_by_me = True
         except Exception as e:
             logger.exception("Failed to start tor: %s", e)
             self.proc = None
+            self.started_by_me = False
             return False
 
-        # Wait for Bootstrapped 100% in stdout (timeout)
+        # Wait for Bootstrapped 100% in stdout (timeout). More tolerant: look for "Bootstrapped 100" substring.
         start = time.time()
         ready = False
         try:
@@ -327,56 +271,96 @@ class TorProcess:
                 line = self.proc.stdout.readline()
                 if not line:
                     time.sleep(0.05)
+                    # still check if port got opened by tor silently
+                    if _is_port_open("127.0.0.1", self.socks_port, timeout=0.2):
+                        ready = True
+                        break
                     continue
                 try:
                     s = line.decode(errors="ignore").strip()
                 except Exception:
                     s = str(line)
                 logger.debug("tor: %s", s)
-                if "Bootstrapped 100%" in s:
-                    ready = True
-                    break
-                # if process died:
+                if "Bootstrapped 100" in s or "Bootstrapped 90" in s:
+                    # treat 100% or high progress as ready -> double-check port
+                    if _is_port_open("127.0.0.1", self.socks_port, timeout=0.5):
+                        ready = True
+                        break
                 if self.proc.poll() is not None:
+                    # process exited
                     break
         except Exception:
             pass
 
         if not ready:
-            logger.info("Tor bootstrap not detected within timeout")
-            # leave process running for diagnostics (caller may stop it)
-            return False
-        logger.info("Tor bootstrapped")
-        return True
+            logger.info("Tor bootstrap not detected within timeout (but leaving process running for diagnosis).")
+            # in case port became available nonetheless
+            if _is_port_open("127.0.0.1", self.socks_port, timeout=0.3):
+                ready = True
+
+        logger.info("Tor bootstrapped status: %s (started_by_me=%s)", ready, self.started_by_me)
+        return ready
 
     def stop(self):
+        # Only stop the process if we started it ourselves
         try:
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()
+            if self.proc and self.started_by_me:
+                pid = self.proc.pid
+                logger.info("Stopping tor pid=%s", pid)
                 try:
+                    self.proc.terminate()
                     self.proc.wait(timeout=3)
                 except Exception:
-                    self.proc.kill()
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
+                # additional platform-specific fallback to ensure child tree is killed
+                if sys.platform.startswith("win"):
+                    try:
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        # kill -9 the pid as last resort
+                        os.kill(pid, 9)
+                    except Exception:
+                        pass
         except Exception:
-            pass
-        self.proc = None
+            logger.exception("Error stopping tor")
+        finally:
+            self.proc = None
+            self.started_by_me = False
 
 # -------------------------
-# Sync worker
+# Sync worker (no AV, strip hash suffix from saved name)
 # -------------------------
+def strip_hash_suffix(fake_name: str) -> str:
+    """
+    fake_name format: sanitized_path__<hmac>
+    We want the displayed/original filename portion without the __hmac part.
+    If there is a '__' token, strip the rightmost suffix; otherwise return original basename.
+    """
+    base = os.path.basename(fake_name)
+    if "__" in base:
+        return base.rsplit("__", 1)[0]
+    return base
+
 class SyncWorker(QThread):
     log = pyqtSignal(str)
     progress = pyqtSignal(int, str)
     security_alert = pyqtSignal(str)
 
-    def __init__(self, peers: List[str], save_dir: str, team_name: str, dl_limit_bps: int, force_av_scan: bool = True):
+    def __init__(self, peers: List[str], save_dir: str, team_name: str, dl_limit_bps: int, force_av_scan: bool = False):
         super().__init__()
         self.peers = [p.strip() for p in peers if p.strip()]
         self.save_dir = save_dir
         self.team_name = team_name
         self.running = True
         self.dl_bucket = TokenBucket(int(dl_limit_bps * 2), float(dl_limit_bps))
-        self.force_av_scan = force_av_scan
+        # force_av_scan parameter kept but not used; AV removed
+        self.force_av_scan = False
 
     def stop(self):
         self.running = False
@@ -395,7 +379,8 @@ class SyncWorker(QThread):
     def run(self):
         session = requests.Session()
         session.proxies.update({"http": f"socks5h://127.0.0.1:{SOCKS_PORT}", "https": f"socks5h://127.0.0.1:{SOCKS_PORT}"})
-        session.timeout = 30
+        # DO NOT set session.timeout (requests.Session has no global timeout attribute)
+        per_request_timeout = 30
 
         while self.running:
             new_count = 0
@@ -407,7 +392,7 @@ class SyncWorker(QThread):
                     continue
                 peer_url = peer if peer.startswith("http") else f"http://{peer}"
                 try:
-                    r = session.get(f"{peer_url}/list", timeout=25)
+                    r = session.get(f"{peer_url}/list", timeout=per_request_timeout)
                     if r.status_code != 200:
                         self.write_log(f"Peer {peer} /list returned {r.status_code}")
                         continue
@@ -425,9 +410,10 @@ class SyncWorker(QThread):
                             break
                         fake = fdesc.get("path")
                         size = int(fdesc.get("size") or 0)
-                        fname = os.path.basename(fake)
-                        # Save path: <save_dir>/<team_name>/<fname>
-                        local_rel = os.path.join(self.team_name, fname)
+                        # Extract real filename without internal __hash
+                        real_fname = strip_hash_suffix(fake)
+                        # Save path: <save_dir>/<team_name>/<real_fname>
+                        local_rel = os.path.join(self.team_name, real_fname)
                         local_path = os.path.join(self.save_dir, local_rel)
                         if os.path.exists(local_path):
                             continue
@@ -435,16 +421,17 @@ class SyncWorker(QThread):
                             self.write_log("Unsafe path detected, skipping: %s" % local_path)
                             continue
                         if size and size > 500 * 1024 * 1024:
-                            self.write_log(f"Skipping huge file {fname}")
+                            self.write_log(f"Skipping huge file {real_fname}")
                             continue
                         tmp_dir = os.path.join(self.save_dir, QUARANTINE_DIRNAME)
                         os.makedirs(tmp_dir, exist_ok=True)
-                        tmp_path = os.path.join(tmp_dir, secrets.token_hex(8) + "_" + fname)
+                        tmp_path = os.path.join(tmp_dir, secrets.token_hex(8) + "_" + real_fname)
                         headers = {"Authorization": f"Bearer {map_token}"}
                         try:
-                            with session.get(f"{peer_url}/download/{map_id}/{fake}", stream=True, timeout=90, headers=headers) as fr:
+                            # Use quoted map_id and fake path as provided by peer (they will be URL-safe)
+                            with session.get(f"{peer_url}/download/{map_id}/{fake}", stream=True, timeout=60, headers=headers) as fr:
                                 if fr.status_code != 200:
-                                    self.write_log(f"Failed to download {fname}: {fr.status_code}")
+                                    self.write_log(f"Failed to download {real_fname}: {fr.status_code}")
                                     try:
                                         if os.path.exists(tmp_path): os.remove(tmp_path)
                                     except: pass
@@ -461,28 +448,21 @@ class SyncWorker(QThread):
                                         dl += len(chunk)
                                         if size:
                                             pct = int(100 * dl / (size or 1))
-                                            self.progress.emit(pct, f"Downloading {fname}")
-                                # finished writing
+                                            self.progress.emit(pct, f"Downloading {real_fname}")
                                 try:
                                     os.chmod(tmp_path, 0o600)
                                 except Exception:
                                     pass
-                                # AV-scan
-                                scan_ok, reason = av_scan_file(tmp_path, force_scan=self.force_av_scan)
-                                if not scan_ok:
-                                    self.write_log(f"AV blocked {fname}: {reason}")
-                                    try: os.remove(tmp_path)
-                                    except: pass
-                                    continue
+                                # NO AV-scan (removed)
                                 # atomic move into final location
                                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
                                 safe_write_atomic(tmp_path, local_path)
                                 os.utime(local_path, (time.time(), int(time.time())))
                                 new_count += 1
-                                self.progress.emit(100, f"Saved {fname}")
+                                self.progress.emit(100, f"Saved {real_fname}")
                                 self.write_log(f"Saved {local_rel}")
                         except Exception as e:
-                            self.write_log(f"Download exception {fname}: {e}")
+                            self.write_log(f"Download exception {real_fname}: {e}")
                             try:
                                 if os.path.exists(tmp_path): os.remove(tmp_path)
                             except: pass
@@ -667,12 +647,13 @@ class MainWindow(QWidget):
         save_settings()
 
     def toggle_tor(self):
-        # Stop if running
-        if self.tor_proc and self.tor_proc.proc:
+        """Start or stop an embedded/external Tor. Safe: only kills what we started."""
+        # Stop if running (we track self.tor_proc)
+        if self.tor_proc:
             self.tor_proc.stop()
             self.tor_proc = None
             self.btn_start_tor.setText("START TOR")
-            self.append_log("Stopped embedded/external Tor")
+            self.append_log("Stopped embedded/external Tor (if started by this app).")
             return
 
         # Start chosen tor
@@ -689,7 +670,8 @@ class MainWindow(QWidget):
         else:
             self.append_log("Tor did not bootstrap in time or failed. Check tor bundle or external path.")
             QMessageBox.warning(self, "Tor bootstrap", "Tor did not bootstrap within 30 seconds. Check bundled tor or external tor.exe.")
-            # keep process running for diagnosis; user may stop it manually
+            # keep tor_proc reference (process might be running) so user can stop it explicitly
+            # if we didn't actually start it, tor_proc.started_by_me==False and stop() won't kill anything.
 
     def toggle_sync(self):
         if self.sync_worker and self.sync_worker.isRunning():
@@ -719,10 +701,12 @@ class MainWindow(QWidget):
 
         # If user requested auto-start Tor and it's not running, attempt start
         if auto_start_tor and (not self.tor_proc or not (self.tor_proc.proc and self.tor_proc.proc.poll() is None)):
-            self.append_log("Auto-starting Tor...")
-            self.tor_proc = TorProcess(socks_port=SOCKS_PORT,
-                                       external_path=(SETTINGS.get("external_tor_path") or None),
-                                       prefer_bundled=SETTINGS.get("use_embedded_tor", True))
+            self.append_log("Auto-starting Tor (if needed)...")
+            # Reuse existing tor_proc if present; otherwise create one
+            if not self.tor_proc:
+                self.tor_proc = TorProcess(socks_port=SOCKS_PORT,
+                                           external_path=(SETTINGS.get("external_tor_path") or None),
+                                           prefer_bundled=SETTINGS.get("use_embedded_tor", True))
             ok = self.tor_proc.start(bootstrap_timeout=30)
             if not ok:
                 QMessageBox.warning(self, "Tor not running", "Tor not running and bootstrap failed. Start Tor manually or check bundle.")
@@ -747,7 +731,8 @@ class MainWindow(QWidget):
             pass
 
         # start worker
-        self.sync_worker = SyncWorker(peers, save_dir, team, dl_limit, force_av_scan=True)
+        # Note: force_av_scan parameter kept but not used (AV removed)
+        self.sync_worker = SyncWorker(peers, save_dir, team, dl_limit, force_av_scan=False)
         self.sync_worker.log.connect(self.append_log)
         self.sync_worker.progress.connect(lambda p, t: (self.progress.setValue(p), self.append_log(t)))
         self.sync_worker.security_alert.connect(lambda m: QMessageBox.critical(self, "Security alert", m))
