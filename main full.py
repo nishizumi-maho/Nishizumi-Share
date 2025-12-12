@@ -11,10 +11,7 @@ Patch summary (minimal, applied globally in this file):
    before mapping to local disk.
  - No other behaviour changed; server still exposes /list, /download, ephemeral
    maps and token logic identical to original except AV bypass.
- - Keep in-file documentation and original flow.
 
-You asked for the full file — here it is with the two changes above applied.
-Use at your own risk.
 """
 # ------------------------------------------------------------------------------ 
 # MIT License header (add LICENSE file to your repo)
@@ -1395,3 +1392,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
