@@ -347,6 +347,26 @@ def strip_hash_suffix(fake_name: str) -> str:
         return base.rsplit("__", 1)[0]
     return base
 
+
+def derive_local_paths(fake_path: str, team_name: str, save_dir: str) -> tuple[str, str, str, str]:
+    """Return relative path, absolute path and temp folder info preserving directories."""
+    clean_path = fake_path.replace("\\", "/")
+    parts = [p for p in Path(clean_path).parts if p not in ("", ".") and p != os.sep]
+    if parts and os.path.isabs(clean_path):
+        parts = parts[1:]  # drop leading root element
+    if not parts:
+        parts = [strip_hash_suffix(os.path.basename(clean_path))]
+
+    filename = strip_hash_suffix(parts[-1])
+    rel_dirs = parts[:-1]
+
+    rel_path = os.path.join(team_name, *rel_dirs, filename)
+    abs_path = os.path.join(save_dir, rel_path)
+    quarantine_base = os.path.join(save_dir, QUARANTINE_DIRNAME, *rel_dirs)
+    tmp_name = secrets.token_hex(8) + "_" + filename
+    tmp_path = os.path.join(quarantine_base, tmp_name)
+    return rel_path, abs_path, quarantine_base, tmp_path
+
 class SyncWorker(QThread):
     log = pyqtSignal(str)
     progress = pyqtSignal(int, str)
@@ -410,11 +430,8 @@ class SyncWorker(QThread):
                             break
                         fake = fdesc.get("path")
                         size = int(fdesc.get("size") or 0)
-                        # Extract real filename without internal __hash
-                        real_fname = strip_hash_suffix(fake)
-                        # Save path: <save_dir>/<team_name>/<real_fname>
-                        local_rel = os.path.join(self.team_name, real_fname)
-                        local_path = os.path.join(self.save_dir, local_rel)
+                        local_rel, local_path, quarantine_dir, tmp_path = derive_local_paths(fake, self.team_name, self.save_dir)
+                        real_fname = os.path.basename(local_rel)
                         if os.path.exists(local_path):
                             continue
                         if not self.is_safe_path(self.save_dir, local_path):
@@ -423,9 +440,7 @@ class SyncWorker(QThread):
                         if size and size > 500 * 1024 * 1024:
                             self.write_log(f"Skipping huge file {real_fname}")
                             continue
-                        tmp_dir = os.path.join(self.save_dir, QUARANTINE_DIRNAME)
-                        os.makedirs(tmp_dir, exist_ok=True)
-                        tmp_path = os.path.join(tmp_dir, secrets.token_hex(8) + "_" + real_fname)
+                        os.makedirs(quarantine_dir, exist_ok=True)
                         headers = {"Authorization": f"Bearer {map_token}"}
                         try:
                             # Use quoted map_id and fake path as provided by peer (they will be URL-safe)

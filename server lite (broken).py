@@ -88,6 +88,7 @@ else:
 def save_settings():
     with open(SETTINGS_FILE, "w") as f:
         json.dump(SETTINGS, f, indent=2)
+    refresh_upload_bucket(SETTINGS.get("upload_limit_bps", DEFAULT_UPLOAD_LIMIT))
 
 # ---------------------------------------------------------
 # START WITH WINDOWS (REGISTRY)
@@ -229,6 +230,17 @@ class TokenBucket:
 
 
 UPLOAD_BUCKET = TokenBucket(DEFAULT_UPLOAD_LIMIT * 2, DEFAULT_UPLOAD_LIMIT)
+
+
+def refresh_upload_bucket(limit_bps: int):
+    """Recreate the global upload bucket when the user changes the limit."""
+    global UPLOAD_BUCKET
+    safe_limit = max(0, int(limit_bps)) or DEFAULT_UPLOAD_LIMIT
+    UPLOAD_BUCKET = TokenBucket(safe_limit * 2, safe_limit)
+
+
+# initialize upload bucket with persisted value
+refresh_upload_bucket(SETTINGS.get("upload_limit_bps", DEFAULT_UPLOAD_LIMIT))
 
 # ---------------------------------------------------------
 # TOR (embedded or external)
