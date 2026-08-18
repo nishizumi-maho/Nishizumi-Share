@@ -1,0 +1,6 @@
+# Runtime dependencies. Pinned to major versions known to work together.
+PyQt6>=6.5
+Flask>=3.0
+waitress>=2.1
+requests>=2.31
+PySocks>=1.7.1

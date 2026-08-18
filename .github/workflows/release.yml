@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (without the leading v)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-installer:
+    name: Build Windows installer
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version $VERSION"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Verify the tag matches the package version
+        shell: bash
+        run: |
+          PKG=$(python -c "import nishizumi_share; print(nishizumi_share.__version__)")
+          if [ "$PKG" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::Tag says ${{ steps.version.outputs.version }} but the package says $PKG"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+      - name: Fetch the Tor Expert Bundle
+        run: python packaging/fetch_tor.py
+
+      - name: Generate the icon
+        run: python packaging/generate_icon.py
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          # Inno Setup ships preinstalled on windows-latest runners.
+          ./packaging/build_windows.ps1 -Version "${{ steps.version.outputs.version }}" -SkipTor
+
+      - name: Show build output
+        shell: bash
+        run: ls -la packaging/output/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            packaging/output/NishizumiShare-Setup-*.exe
+            packaging/output/SHA256SUMS.txt
+          retention-days: 14
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          NOTES_FILE=$(mktemp)
+
+          {
+            echo "## Nishizumi Share $VERSION"
+            echo
+            if [ -f CHANGELOG.md ]; then
+              # Take the section for this version out of the changelog.
+              awk -v ver="$VERSION" '
+                $0 ~ "^## \\[?" ver { found=1; next }
+                found && /^## / { exit }
+                found { print }
+              ' CHANGELOG.md
+            fi
+            echo
+            echo "### Install"
+            echo
+            echo "Download \`NishizumiShare-Setup-$VERSION.exe\` and run it."
+            echo "The app updates itself from future releases."
+            echo
+            echo "### Verify the download"
+            echo
+            echo '```powershell'
+            echo "Get-FileHash -Algorithm SHA256 NishizumiShare-Setup-$VERSION.exe"
+            echo '```'
+            echo
+            echo "Compare against \`SHA256SUMS.txt\` attached below."
+          } > "$NOTES_FILE"
+
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Nishizumi Share $VERSION" \
+            --notes-file "$NOTES_FILE" \
+            packaging/output/NishizumiShare-Setup-*.exe \
+            packaging/output/SHA256SUMS.txt

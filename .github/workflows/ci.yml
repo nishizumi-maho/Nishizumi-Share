@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # The core test-suite is Qt-free, so PyQt6 is not needed here.
+          pip install Flask waitress requests PySocks pytest pytest-timeout
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+  lint:
+    name: Syntax and import check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install Flask waitress requests PySocks
+
+      - name: Byte-compile every module
+        run: python -m compileall -q nishizumi_share packaging tests
+
+      - name: Import the Qt-free core
+        run: |
+          python - <<'PY'
+          import importlib
+          for module in [
+              "config", "security", "throttle", "avscan", "tor",
+              "server", "syncclient", "updater", "desktop",
+              "logging_setup", "controller",
+          ]:
+              importlib.import_module(f"nishizumi_share.{module}")
+          print("core imports OK")
+          PY
+
+      - name: Check the version is consistent
+        run: |
+          python - <<'PY'
+          import re, pathlib, nishizumi_share
+          pyproject = pathlib.Path("pyproject.toml").read_text()
+          declared = re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1)
+          assert declared == nishizumi_share.__version__, (
+              f"pyproject.toml says {declared}, package says {nishizumi_share.__version__}"
+          )
+          print("version", declared)
+          PY

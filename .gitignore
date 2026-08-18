@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Packaging output
+packaging/output/
+packaging/tor/
+*.spec.bak
+
+# Bundled Tor (downloaded at build time, never committed)
+/tor/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
