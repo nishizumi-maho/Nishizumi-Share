@@ -249,13 +249,19 @@ This downloads and verifies the Tor Expert Bundle, generates the icon, freezes
 the app, compiles the installer into `packaging\output\`, and writes
 `SHA256SUMS.txt`.
 
-Tagging a release runs the same steps in CI and publishes the result:
+Releases are produced by CI, either way you start them:
 
 ```bash
+# Push a tag...
 git tag v3.0.1 && git push origin v3.0.1
 ```
 
-The tag must match `nishizumi_share.__version__` or the build fails.
+...or run the **Release** workflow from the Actions tab and give it the version
+number; it creates the tag at the commit it built. Either route runs the tests,
+builds the installer, writes `SHA256SUMS.txt` and publishes the release.
+
+The version must match `nishizumi_share.__version__` or the build fails, which
+keeps the tag, the installer filename and what the updater reports in sync.
 
 ---
 

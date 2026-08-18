@@ -89,12 +89,12 @@ jobs:
           retention-days: 14
 
       - name: Publish the release
-        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
+          TAG="v$VERSION"
           NOTES_FILE=$(mktemp)
 
           {
@@ -123,8 +123,20 @@ jobs:
             echo "Compare against \`SHA256SUMS.txt\` attached below."
           } > "$NOTES_FILE"
 
-          gh release create "$GITHUB_REF_NAME" \
-            --title "Nishizumi Share $VERSION" \
-            --notes-file "$NOTES_FILE" \
-            packaging/output/NishizumiShare-Setup-*.exe \
-            packaging/output/SHA256SUMS.txt
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading assets to it"
+            gh release upload "$TAG" --clobber \
+              packaging/output/NishizumiShare-Setup-*.exe \
+              packaging/output/SHA256SUMS.txt
+          else
+            # --target creates the tag at this commit when it does not exist,
+            # so a manual run can publish without pushing a tag first.
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "Nishizumi Share $VERSION" \
+              --notes-file "$NOTES_FILE" \
+              packaging/output/NishizumiShare-Setup-*.exe \
+              packaging/output/SHA256SUMS.txt
+          fi
+
+          echo "Published: $(gh release view "$TAG" --json url --jq .url)"
