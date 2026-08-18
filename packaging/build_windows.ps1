@@ -87,7 +87,8 @@ try {
     if (-not $installer) { throw "No installer produced in $outputDir" }
 
     $hash = (Get-FileHash -Algorithm SHA256 -Path $installer.FullName).Hash.ToLower()
-    "$hash  $($installer.Name)" | Set-Content -Path (Join-Path $outputDir "SHA256SUMS.txt") -Encoding ascii -NoNewline
+    # Trailing newline keeps the file compatible with `sha256sum -c`.
+    "$hash  $($installer.Name)`n" | Set-Content -Path (Join-Path $outputDir "SHA256SUMS.txt") -Encoding ascii -NoNewline
 
     Write-Host "`nInstaller: $($installer.FullName)" -ForegroundColor Green
     Write-Host "SHA-256  : $hash" -ForegroundColor Green

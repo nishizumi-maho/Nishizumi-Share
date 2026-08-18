@@ -60,10 +60,19 @@ jobs:
       - name: Generate the icon
         run: python packaging/generate_icon.py
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          # Pin to a known-good major version rather than relying on whatever
+          # the runner image happens to ship; the .iss uses 6.3+ directives.
+          choco install innosetup --version=6.4.3 --no-progress -y
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found after install" }
+          & $iscc /? | Select-Object -First 1
+
       - name: Build the installer
         shell: pwsh
         run: |
-          # Inno Setup ships preinstalled on windows-latest runners.
           ./packaging/build_windows.ps1 -Version "${{ steps.version.outputs.version }}" -SkipTor
 
       - name: Show build output
