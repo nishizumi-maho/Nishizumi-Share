@@ -60,15 +60,42 @@ jobs:
       - name: Generate the icon
         run: python packaging/generate_icon.py
 
-      - name: Install Inno Setup
+      - name: Ensure Inno Setup is available
         shell: pwsh
         run: |
-          # Pin to a known-good major version rather than relying on whatever
-          # the runner image happens to ship; the .iss uses 6.3+ directives.
-          choco install innosetup --version=6.4.3 --no-progress -y
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found after install" }
-          & $iscc /? | Select-Object -First 1
+          # windows-latest already ships Inno Setup 6, usually newer than any
+          # version we could pin — so look first and only install if missing.
+          # (Pinning a version made choco refuse to downgrade and fail the job.)
+          function Find-ISCC {
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+            )
+            foreach ($candidate in $candidates) {
+              if (Test-Path $candidate) { return $candidate }
+            }
+            $onPath = Get-Command iscc.exe -ErrorAction SilentlyContinue
+            if ($onPath) { return $onPath.Source }
+            return $null
+          }
+
+          $iscc = Find-ISCC
+          if (-not $iscc) {
+            Write-Host "Inno Setup not present; installing the latest version"
+            choco install innosetup --no-progress -y
+            $iscc = Find-ISCC
+          }
+
+          if (-not $iscc) { throw "ISCC.exe is not available on this runner" }
+
+          # Read the version from the file rather than running `iscc /?`,
+          # which exits non-zero and would fail the step.
+          $version = (Get-Item $iscc).VersionInfo.ProductVersion
+          Write-Host "Using Inno Setup $version at $iscc"
+
+          if ([version]($version -split '-')[0] -lt [version]"6.3") {
+            throw "Inno Setup 6.3+ is required (installer.iss uses 6.3 directives), found $version"
+          }
 
       - name: Build the installer
         shell: pwsh
