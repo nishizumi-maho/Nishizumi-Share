@@ -63,9 +63,10 @@ jobs:
       - name: Ensure Inno Setup is available
         shell: pwsh
         run: |
-          # windows-latest already ships Inno Setup 6, usually newer than any
-          # version we could pin — so look first and only install if missing.
-          # (Pinning a version made choco refuse to downgrade and fail the job.)
+          # windows-latest already ships Inno Setup 6, so look before installing.
+          # No version probe here: ISCC.exe reports ProductVersion 0.0.0.0, and
+          # if the compiler were too old the .iss compile itself says so with a
+          # far better message than anything we could check for.
           function Find-ISCC {
             $candidates = @(
               "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
@@ -87,15 +88,7 @@ jobs:
           }
 
           if (-not $iscc) { throw "ISCC.exe is not available on this runner" }
-
-          # Read the version from the file rather than running `iscc /?`,
-          # which exits non-zero and would fail the step.
-          $version = (Get-Item $iscc).VersionInfo.ProductVersion
-          Write-Host "Using Inno Setup $version at $iscc"
-
-          if ([version]($version -split '-')[0] -lt [version]"6.3") {
-            throw "Inno Setup 6.3+ is required (installer.iss uses 6.3 directives), found $version"
-          }
+          Write-Host "Inno Setup compiler: $iscc"
 
       - name: Build the installer
         shell: pwsh
